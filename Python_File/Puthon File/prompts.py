@@ -59,11 +59,27 @@ RULES:
   (not the client's literal request).
 - industry = your best-guess industry/vertical for this business (e.g. "dental clinic",
   "e-commerce", "real estate", "coaching business"), based only on what's in the post.
+- problem_pattern = a short, normalized, reusable identifier for the underlying problem PATTERN
+  itself, independent of industry - written in lower_snake_case, 2-4 words. This is the single
+  most important field for spotting market-wide demand, so it must be general enough that the
+  SAME pattern gets the SAME label across different posts and different industries.
+    - Think of it as a category label, not a summary of this one post. "lead_follow_up_delay",
+      "manual_order_data_entry", "manual_inventory_sync", "manual_appointment_scheduling",
+      "slow_customer_support_response" are good examples of the right level of generality.
+    - Two posts that describe the same underlying operational problem should get the exact same
+      problem_pattern even if they're in different industries (a dental clinic's slow appointment
+      booking and a med spa's slow appointment booking are BOTH "manual_appointment_scheduling").
+    - Conversely, do not merge genuinely different problems just because they share an industry.
+      An e-commerce post about Shopify/inventory sync errors ("manual_inventory_sync") and an
+      e-commerce post about manual order-entry data entry ("manual_order_data_entry") are
+      DIFFERENT patterns and must get different labels, even though both are "e-commerce".
+    - If you are ever unsure, prefer the more general/reusable label over a hyper-specific one -
+      that is what makes the frequency count across posts meaningful.
 
 Return ONLY a JSON object with exactly these keys:
-evidence, extracted_problem, industry, hiring_type, task_frequency, time_cost, business_impact,
-current_solution, tools_involved, urgency, problem_confidence, confidence_reason, automation_fit,
-solution_type
+evidence, extracted_problem, industry, problem_pattern, hiring_type, task_frequency, time_cost,
+business_impact, current_solution, tools_involved, urgency, problem_confidence, confidence_reason,
+automation_fit, solution_type
 """
 
 USER_TEMPLATE = """Analyze this single Upwork job post.

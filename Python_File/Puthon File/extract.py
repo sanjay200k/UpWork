@@ -95,6 +95,7 @@ LLM_FIELDS = [
     "evidence",
     "extracted_problem",
     "industry",
+    "problem_pattern",
     "hiring_type",
     "task_frequency",
     "time_cost",
@@ -130,6 +131,7 @@ ANALYSIS_COLUMNS = [
     "evidence",
     "extracted_problem",
     "industry",
+    "problem_pattern",
     "hiring_type",
     "task_frequency",
     "problem_occurrence",
@@ -371,15 +373,30 @@ def save_occurrence_store(store: dict):
         json.dump(store, f, indent=2, sort_keys=True)
 
 
-def occurrence_key(industry: str, hiring_type: str) -> str:
-    """Groups by industry + hiring_type as a practical proxy for 'this
-    problem pattern'. True clustering would compare extracted_problem text
-    semantically across posts - fine to upgrade to that later (e.g. with
-    embeddings) once volume justifies it; this keeps Step 1 simple and
-    honest about what it's actually counting."""
-    industry_norm = (industry or "unknown").strip().lower()
-    hiring_norm = (hiring_type or "unknown").strip().lower()
-    return f"{industry_norm}::{hiring_norm}"
+def normalize_problem_pattern(problem_pattern: str) -> str:
+    """Normalize the model's problem_pattern label to lower_snake_case so
+    minor formatting differences ("Lead Follow-Up Delay" vs
+    "lead_follow_up_delay") don't fragment the count. This does NOT solve
+    genuine semantic drift (the model calling the same real-world pattern
+    two different names across posts) - that needs either a controlled
+    vocabulary you maintain over time, or an embeddings-based similarity
+    match once volume justifies the added complexity. This is the
+    string-level normalization half of that fix."""
+    if is_empty(problem_pattern):
+        return "unclassified_problem"
+    s = str(problem_pattern).strip().lower()
+    s = re.sub(r"[^a-z0-9]+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s or "unclassified_problem"
+
+
+def occurrence_key(problem_pattern: str) -> str:
+    """Groups by the normalized problem_pattern itself - e.g.
+    "lead_follow_up_delay" - so the count reflects how many Upwork posts
+    have exhibited THIS problem, regardless of which industry it showed up
+    in, per the plan's definition: 'how often this problem pattern appears
+    across Upwork posts' (e.g. 17 relevant posts this month)."""
+    return normalize_problem_pattern(problem_pattern)
 
 
 def add_provenance_and_occurrence(analysis: dict, row: dict, occurrence_store: dict, row_index: int) -> dict:
@@ -390,7 +407,11 @@ def add_provenance_and_occurrence(analysis: dict, row: dict, occurrence_store: d
     analysis["date_collected"] = datetime.date.today().isoformat()
     analysis["client_spend_signal"] = row.get("client_total_spend", "")
 
-    key = occurrence_key(analysis.get("industry"), analysis.get("hiring_type"))
+    # Normalize problem_pattern in place so the CSV column and the occurrence
+    # key always agree (e.g. "Lead Follow-Up Delay" -> "lead_follow_up_delay").
+    analysis["problem_pattern"] = normalize_problem_pattern(analysis.get("problem_pattern"))
+
+    key = occurrence_key(analysis["problem_pattern"])
     occurrence_store[key] = occurrence_store.get(key, 0) + 1
     analysis["problem_occurrence"] = occurrence_store[key]
 
