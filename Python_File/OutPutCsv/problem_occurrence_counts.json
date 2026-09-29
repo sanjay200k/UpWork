@@ -1,17 +1,17 @@
 {
-  "chatbot_feasibility_assessment": 1,
-  "generic_ai_assistant_exploration": 1,
-  "lead_follow_up_delay": 1,
+  "lead_follow_up_delay": 3,
   "manual_appointment_reminders": 1,
-  "manual_appointment_scheduling": 1,
+  "manual_appointment_scheduling": 4,
   "manual_client_onboarding": 1,
   "manual_customer_support_responses": 1,
   "manual_data_sync": 1,
+  "manual_invoice_creation_and_payment_followup": 1,
+  "manual_invoice_follow_up": 1,
   "manual_invoice_processing": 1,
   "manual_lead_follow_up_delay": 1,
-  "manual_order_data_entry": 1,
-  "manual_process_automation": 1,
+  "manual_order_data_entry": 3,
   "manual_social_media_management": 1,
-  "manual_whatsapp_order_handling": 1,
-  "missing_ai_chatbot": 1
+  "manual_whatsapp_order_handling": 2,
+  "missing_online_presence": 1,
+  "slow_customer_support_response": 1
 }

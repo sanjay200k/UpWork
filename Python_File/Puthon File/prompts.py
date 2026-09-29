@@ -6,10 +6,32 @@ real businesses found elsewhere (Google Maps, reviews, websites). You are NOT sc
 as a lead. You are building one row of a "problem_library" - a reusable record of a recurring
 business pain.
 
+IMPORTANT: the post you're given may be about ANYTHING - not just an obvious "hire a VA" or "add
+AI/chatbot" post. It could be a graphic design job, a bookkeeping job, a wedding photographer
+listing, anything. Your FIRST job is to decide whether the post reveals a real, automatable
+operational problem at all - most posts, even ones with nothing to do with AI, mention some
+manual process in passing (e.g. a designer's client says "I currently email files back and forth
+with no proofing system", or a bookkeeping post mentions "I manually reconcile 200 transactions a
+month"). Only flag it as relevant if there's an actual described business process a human is doing
+repeatedly and manually - not just because the industry sounds interesting or the client seems
+busy.
+
 You will be given ONE Upwork job post (title + description + metadata). Analyze it and return a
 single JSON object (and nothing else - no markdown fences, no commentary).
 
-RULES:
+STEP 0 - RELEVANCE GATE (always fill this first):
+- is_automation_relevant = true or false. true only if the post describes (explicitly or in
+  passing) a real, recurring, manual operational task that automation/AI/a website could plausibly
+  improve - regardless of whether the client asked for automation. false if the post is purely
+  about a one-off creative/professional deliverable with no recurring operational pain mentioned
+  (e.g. "design me a logo", "write a one-time business plan", "photograph my wedding") and no
+  automatable process is described anywhere in the text.
+- relevance_reason = one sentence on why you set is_automation_relevant the way you did, quoting
+  or closely paraphrasing the specific line that triggered it (or noting there was none).
+- If is_automation_relevant is false, set every other field below to null or an empty array and
+  stop there - do not guess at problem details for a post with no real automatable content.
+
+RULES (only apply once is_automation_relevant is true):
 - Do not blindly trust the client's requested solution (e.g. "I need a chatbot"). Find the
   underlying business problem the request is actually solving for.
 - Never invent numbers or facts. If a value is not present or clearly implied in the text,
@@ -28,6 +50,9 @@ RULES:
   in the text). Do not let mentions of "AI", "automation", "n8n", "Zapier", "ChatGPT", or a large
   client budget push confidence or automation_fit up on their own - only real, quantified pain
   should do that.
+  A post whose main ask is unrelated (design, writing, photography) but which mentions a manual
+  process in passing is "replacing human labor" if that mentioned process is already done by a
+  person today, otherwise "exploring AI/tech upgrade".
 - task_frequency = how often THIS business performs the task in question (e.g. "30 follow-ups/day",
   "daily", "every order"). This is about the business's own operations, not about Upwork as a
   platform. Use null if not stated or clearly implied.
@@ -53,6 +78,11 @@ RULES:
 - solution_type = a JSON array containing one or more of: "AI", "Automation", "Website". Pick only
   the categories that plausibly fit the underlying problem. Do not include a category just because
   the client mentioned it if the underlying problem doesn't actually call for it.
+    - Include "Website" whenever the real underlying problem is that the business has no site, an
+      outdated one, or no online booking/ordering/lead-capture page - even if the client's literal
+      ask is "add a chatbot" or "add AI." A vague "we want to look modern" or "competitors have a
+      chatbot" request is frequently a website/online-presence gap wearing an AI label; call it
+      "Website" (possibly alongside "AI") when that's the real problem, not just "AI".
 - evidence = the specific facts (quoted or closely paraphrased) from the post that justify your
   analysis. Keep this to the most relevant 1-3 sentences.
 - extracted_problem = your own one-sentence paraphrase of the real underlying business problem
@@ -77,9 +107,9 @@ RULES:
       that is what makes the frequency count across posts meaningful.
 
 Return ONLY a JSON object with exactly these keys:
-evidence, extracted_problem, industry, problem_pattern, hiring_type, task_frequency, time_cost,
-business_impact, current_solution, tools_involved, urgency, problem_confidence, confidence_reason,
-automation_fit, solution_type
+is_automation_relevant, relevance_reason, evidence, extracted_problem, industry, problem_pattern,
+hiring_type, task_frequency, time_cost, business_impact, current_solution, tools_involved,
+urgency, problem_confidence, confidence_reason, automation_fit, solution_type
 """
 
 USER_TEMPLATE = """Analyze this single Upwork job post.

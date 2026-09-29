@@ -1,0 +1,16 @@
+{
+  "generic_task_automation": 1,
+  "lead_follow_up_delay": 2,
+  "manual_appointment_reminders": 1,
+  "manual_appointment_scheduling": 1,
+  "manual_client_onboarding": 1,
+  "manual_customer_support_email": 1,
+  "manual_data_sync_error": 1,
+  "manual_invoice_processing": 1,
+  "manual_order_data_entry": 1,
+  "manual_order_response_delay": 1,
+  "manual_process_time_waste": 1,
+  "manual_social_media_management": 1,
+  "undefined_chatbot_requirements": 1,
+  "website_modernization_gap": 1
+}

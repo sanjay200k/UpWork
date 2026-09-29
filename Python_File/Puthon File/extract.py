@@ -65,7 +65,7 @@ REASONING_EFFORT = "low"       # low | medium | high
 REASONING_FORMAT = "hidden"    # hidden | parsed | raw
 
 # Where enriched CSVs land by default (used when no output path is given
-# on the command line). Change this if you move the project folder.
+# on the command line). Change this path if you move the project folder.
 DEFAULT_OUTPUT_DIR = r"F:\AI automation\Up_work_Leads\main Project\UpWork\Python_File\OutPutCsv"
 
 # Where the running problem_occurrence counts are stored, so this pattern-
@@ -73,6 +73,19 @@ DEFAULT_OUTPUT_DIR = r"F:\AI automation\Up_work_Leads\main Project\UpWork\Python
 # just within a single 15-row file (a single small batch can't tell you
 # "17 posts this month" on its own).
 OCCURRENCE_STORE_PATH = os.path.join(DEFAULT_OUTPUT_DIR, "problem_occurrence_counts.json")
+
+# Suffix for the sidecar CSV that captures posts the relevance gate rejected
+# (is_automation_relevant = false) - kept separate from problem_library so a
+# "design me a logo" post never pollutes the real pipeline, but nothing is
+# silently thrown away either; you can audit what got filtered and why.
+FILTERED_OUT_PATH_SUFFIX = "_filtered_out.csv"
+
+# Tracks every source_job_id ever processed, across every batch/run. Without
+# this, running the same CSV twice (or two weekly batches that happen to
+# overlap on a job post) silently inflates problem_occurrence counts with
+# duplicate posts, which corrupts the "market-wide demand" signal the plan
+# relies on.
+SEEN_JOBS_STORE_PATH = os.path.join(DEFAULT_OUTPUT_DIR, "seen_job_ids.json")
 
 # Rate limits (429s) are different from a bad/truncated response: they mean
 # "you've used up your tokens-per-minute quota, slow down" rather than
@@ -165,12 +178,29 @@ def is_empty(value) -> bool:
     return s in ("", "null", "none", "n/a", "na")
 
 
+# prompts.py explicitly tells the model task_frequency can be a bare cadence
+# word like "daily" with no digit in it (see SYSTEM_PROMPT's own example).
+# The old digit-only check didn't recognize that, so a fully-described daily
+# task with no other numbers got silently treated as unquantified and its
+# confidence got capped to Low even though the model's reasoning (correctly)
+# said otherwise. Recognize named cadences as quantified too.
+NAMED_CADENCE_RE = re.compile(
+    r"\b(daily|weekly|monthly|yearly|annually|hourly|nightly|"
+    r"every\s+(day|night|week|month|shift|order|call|hour)|"
+    r"per\s+(day|night|week|month|shift|order|call|hour))\b",
+    re.IGNORECASE,
+)
+
+
 def is_quantified(value) -> bool:
-    """A field counts as quantified evidence only if it has real text AND
-    contains at least one digit (a number, frequency, or amount)."""
+    """A field counts as quantified evidence if it has real text AND either
+    contains a digit (a number, frequency, or amount) or names a concrete
+    recurring cadence (daily, weekly, every shift, ...). Vague words like
+    "often", "a lot", or "regularly" still do not count."""
     if is_empty(value):
         return False
-    return bool(re.search(r"\d", str(value)))
+    s = str(value)
+    return bool(re.search(r"\d", s)) or bool(NAMED_CADENCE_RE.search(s))
 
 
 def get_client() -> Groq:
@@ -277,7 +307,7 @@ def call_model(client: Groq, row: dict) -> dict:
                 _print_raw_error_body(e)
                 time.sleep(wait_seconds)
 
-                if rate_limit_hits > RATE_LIMIT_MAX_RETRIES:
+                if rate_limit_hits >= RATE_LIMIT_MAX_RETRIES:
                     raise RuntimeError(
                         f"Still rate limited after {rate_limit_hits} escalating waits: {e}"
                     )
@@ -306,12 +336,25 @@ def apply_hard_gate(analysis: dict) -> dict:
         confidence unless evidence is quantified" rule.
     This never upgrades the model's own confidence - only downgrades it.
     """
+    # Validate hiring_type against the enum the prompt promises. If the model
+    # drifts (different wording/casing), the "==" checks below would silently
+    # never match and the curiosity-specific cap would never fire. Normalize
+    # instead of trusting it blindly.
+    hiring_type = analysis.get("hiring_type")
+    if hiring_type not in (HIRING_TYPE_LABOR, HIRING_TYPE_CURIOSITY):
+        normalized = str(hiring_type or "").strip().lower()
+        if "labor" in normalized or "hire" in normalized or "hiring" in normalized:
+            hiring_type = HIRING_TYPE_LABOR
+        else:
+            hiring_type = HIRING_TYPE_CURIOSITY
+        analysis["hiring_type"] = hiring_type
+
     quantified_count = sum(1 for f in QUANTIFICATION_FIELDS if is_quantified(analysis.get(f)))
     fully_quantified = quantified_count == len(QUANTIFICATION_FIELDS)
     any_quantified = quantified_count > 0
 
-    hiring_type = analysis.get("hiring_type")
-    confidence = analysis.get("problem_confidence")
+    original_confidence = analysis.get("problem_confidence")
+    confidence = original_confidence
     if confidence not in CONFIDENCE_ORDER:
         confidence = "Low"  # unrecognized/missing value - treat as worst case
 
@@ -320,24 +363,57 @@ def apply_hard_gate(analysis: dict) -> dict:
             return ceiling
         return value
 
+    gate_note = None
+
     # Base hard gate: zero quantified evidence at all -> Low, no exceptions.
     if not any_quantified:
-        confidence = cap(confidence, "Low")
+        new_confidence = cap(confidence, "Low")
+        if new_confidence != confidence:
+            gate_note = ("Hard gate applied: no quantified task_frequency, "
+                         "time_cost, or business_impact was found, so confidence "
+                         f"was capped from {confidence} to {new_confidence}.")
+        confidence = new_confidence
     # hiring_type weighting: curiosity/exploratory posts need FULL
     # quantification to earn anything above Medium; partial quantification
     # only earns Medium at most. "Replacing human labor" posts are proven,
     # funded pain, so partial quantification is enough to reach Medium/High
     # based on the model's own judgement.
     elif hiring_type == HIRING_TYPE_CURIOSITY and not fully_quantified:
-        confidence = cap(confidence, "Medium")
+        new_confidence = cap(confidence, "Medium")
+        if new_confidence != confidence:
+            gate_note = ("Hard gate applied: hiring_type is 'exploring AI/tech "
+                         "upgrade' without full quantification, so confidence "
+                         f"was capped from {confidence} to {new_confidence}.")
+        confidence = new_confidence
 
     analysis["problem_confidence"] = confidence
+
+    # Keep confidence_reason honest. Previously the model's original reasoning
+    # (which could argue for a HIGHER confidence than the gate allows) was left
+    # untouched, so the stored reason and the final label could contradict
+    # each other. Append, don't discard - the model's reasoning is still
+    # useful context for a human reviewer.
+    if gate_note:
+        existing_reason = analysis.get("confidence_reason") or ""
+        analysis["confidence_reason"] = (
+            f"{existing_reason.strip()} {gate_note}".strip()
+        )
 
     # If confidence got capped to Low, automation_fit claims of "High" are
     # also suspect - the underlying problem itself is not well-established
     # yet, so don't let a strong automation_fit rating stand unchallenged.
     if confidence == "Low" and analysis.get("automation_fit") == "High":
         analysis["automation_fit"] = "Medium"
+
+    # Validate solution_type against the allowed enum so a hallucinated or
+    # malformed category never silently reaches the CSV.
+    allowed_solutions = {"AI", "Automation", "Website"}
+    solution_type = analysis.get("solution_type")
+    if isinstance(solution_type, list):
+        cleaned = [s for s in solution_type if s in allowed_solutions]
+        analysis["solution_type"] = cleaned or ["Automation"]
+    elif solution_type not in allowed_solutions:
+        analysis["solution_type"] = ["Automation"]
 
     return analysis
 
@@ -371,6 +447,22 @@ def save_occurrence_store(store: dict):
     os.makedirs(os.path.dirname(OCCURRENCE_STORE_PATH), exist_ok=True)
     with open(OCCURRENCE_STORE_PATH, "w", encoding="utf-8") as f:
         json.dump(store, f, indent=2, sort_keys=True)
+
+
+def load_seen_jobs() -> set:
+    if os.path.isfile(SEEN_JOBS_STORE_PATH):
+        try:
+            with open(SEEN_JOBS_STORE_PATH, "r", encoding="utf-8") as f:
+                return set(json.load(f))
+        except (json.JSONDecodeError, OSError):
+            print(f"  WARNING: could not read {SEEN_JOBS_STORE_PATH}, starting fresh.")
+    return set()
+
+
+def save_seen_jobs(seen: set):
+    os.makedirs(os.path.dirname(SEEN_JOBS_STORE_PATH), exist_ok=True)
+    with open(SEEN_JOBS_STORE_PATH, "w", encoding="utf-8") as f:
+        json.dump(sorted(seen), f, indent=2)
 
 
 def normalize_problem_pattern(problem_pattern: str) -> str:
@@ -475,6 +567,12 @@ def print_summary(enriched_rows: list):
 def main():
     args = sys.argv[1:]
 
+    fresh = "--fresh" in args
+    if fresh:
+        args = [a for a in args if a != "--fresh"]
+        print("--fresh: ignoring seen_job_ids.json - every row will be reprocessed "
+              "and problem_occurrence counts will be re-added on top of existing ones.")
+
     if len(args) >= 1:
         input_path = args[0]
     else:
@@ -494,6 +592,8 @@ def main():
             base = base[: -len("_enriched")]
         os.makedirs(DEFAULT_OUTPUT_DIR, exist_ok=True)
         output_path = os.path.join(DEFAULT_OUTPUT_DIR, f"{base}_enriched.csv")
+
+    filtered_out_path = os.path.splitext(output_path)[0].replace("_enriched", "") + FILTERED_OUT_PATH_SUFFIX
 
     df = pd.read_csv(input_path, dtype=str).fillna("")
 
@@ -522,47 +622,119 @@ def main():
 
     client = get_client()
     occurrence_store = load_occurrence_store()
+    seen_jobs = set() if fresh else load_seen_jobs()
 
-    enriched_rows = []
+    fieldnames = REQUIRED_INPUT_COLUMNS + [
+        c for c in df.columns if c not in REQUIRED_INPUT_COLUMNS
+    ] + ANALYSIS_COLUMNS
+
     total = len(input_rows)
     print(f"Processing {total} rows from {input_path} ...")
 
-    for i, row in enumerate(input_rows, start=1):
-        title_preview = str(row.get("job_title", ""))[:50]
-        print(f"[{i}/{total}] {title_preview}")
-
+    # Open the output file once and flush after every row, so a crash partway
+    # through (rate limits, a killed process, a laptop sleeping) doesn't lose
+    # every row processed so far - only the ones still to come.
+    # If the output file already has rows in it (from an earlier run this is
+    # resuming), preserve them instead of silently dropping them. Overwriting
+    # the file while skipping already-seen rows was losing those rows
+    # entirely - they existed in a *previous* output file, not this one.
+    existing_rows_by_id = {}
+    if os.path.isfile(output_path) and not fresh:
         try:
-            analysis = call_model(client, row)
-            analysis = apply_hard_gate(analysis)
-            analysis = add_provenance_and_occurrence(analysis, row, occurrence_store, i)
-            analysis = normalize_for_csv(analysis)
+            existing_df = pd.read_csv(output_path, dtype=str).fillna("")
+            for rec in existing_df.to_dict(orient="records"):
+                sid = rec.get("source_job_id")
+                if sid:
+                    existing_rows_by_id[sid] = rec
+            if existing_rows_by_id:
+                print(f"Carrying forward {len(existing_rows_by_id)} previously-processed "
+                      f"row(s) from the existing output file.")
         except Exception as e:
-            print(f"  FAILED to analyze row {i}: {e}")
-            analysis = {col: "ERROR" for col in ANALYSIS_COLUMNS}
+            print(f"  WARNING: could not read existing output file to preserve it "
+                  f"({e}) - it will be overwritten.")
 
-        merged = dict(row)
-        for col in ANALYSIS_COLUMNS:
-            merged[col] = analysis.get(col, "")
-        enriched_rows.append(merged)
+    out_file = open(output_path, "w", newline="", encoding="utf-8")
+    writer = csv_module.DictWriter(out_file, fieldnames=fieldnames, quoting=csv_module.QUOTE_ALL)
+    writer.writeheader()
+    for rec in existing_rows_by_id.values():
+        writer.writerow({k: rec.get(k, "") for k in fieldnames})
+    out_file.flush()
 
-        # Be polite to the API between calls
-        time.sleep(0.5)
+    filtered_fieldnames = ["source_job_id", "job_title", "job_url", "relevance_reason"]
+    filtered_file = open(filtered_out_path, "w", newline="", encoding="utf-8")
+    filtered_writer = csv_module.DictWriter(filtered_file, fieldnames=filtered_fieldnames, quoting=csv_module.QUOTE_ALL)
+    filtered_writer.writeheader()
+    filtered_count = 0
 
-    save_occurrence_store(occurrence_store)
+    enriched_rows = list(existing_rows_by_id.values())
 
-    fieldnames = REQUIRED_INPUT_COLUMNS + ANALYSIS_COLUMNS
-    # Preserve any extra input columns beyond the required ones
-    extra_cols = [c for c in df.columns if c not in REQUIRED_INPUT_COLUMNS]
-    fieldnames = REQUIRED_INPUT_COLUMNS + extra_cols + ANALYSIS_COLUMNS
+    try:
+        for i, row in enumerate(input_rows, start=1):
+            title_preview = str(row.get("job_title", ""))[:50]
+            job_id_preview = make_source_job_id(row.get("job_url", ""), row.get("job_title", ""))
 
-    with open(output_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv_module.DictWriter(f, fieldnames=fieldnames, quoting=csv_module.QUOTE_ALL)
-        writer.writeheader()
-        for r in enriched_rows:
-            writer.writerow({k: r.get(k, "") for k in fieldnames})
+            if job_id_preview in seen_jobs:
+                print(f"[{i}/{total}] SKIPPED (already processed): {title_preview}")
+                continue
+
+            print(f"[{i}/{total}] {title_preview}")
+
+            try:
+                analysis = call_model(client, row)
+
+                # Relevance gate: this post might not be about automation at
+                # all (a design job, a photography job, etc). Only run the
+                # hard gate / provenance / occurrence tracking on posts that
+                # actually describe an automatable problem.
+                if not analysis.get("is_automation_relevant", True):
+                    reason = analysis.get("relevance_reason", "")
+                    print(f"  FILTERED OUT (not automation-relevant): {reason}")
+                    filtered_writer.writerow({
+                        "source_job_id": job_id_preview,
+                        "job_title": row.get("job_title", ""),
+                        "job_url": row.get("job_url", ""),
+                        "relevance_reason": reason,
+                    })
+                    filtered_file.flush()
+                    filtered_count += 1
+                    seen_jobs.add(job_id_preview)  # don't re-check it every run
+                    continue
+
+                analysis = apply_hard_gate(analysis)
+                analysis = add_provenance_and_occurrence(analysis, row, occurrence_store, i)
+                analysis = normalize_for_csv(analysis)
+                seen_jobs.add(job_id_preview)
+            except Exception as e:
+                print(f"  FAILED to analyze row {i}: {e}")
+                analysis = {col: "ERROR" for col in ANALYSIS_COLUMNS}
+                # Do NOT mark as seen - a failed row should be retried on the
+                # next run, not silently skipped forever.
+
+            merged = dict(row)
+            for col in ANALYSIS_COLUMNS:
+                merged[col] = analysis.get(col, "")
+            enriched_rows.append(merged)
+
+            writer.writerow({k: merged.get(k, "") for k in fieldnames})
+            out_file.flush()
+
+            # Checkpoint the stores every 5 rows too, not just at the end.
+            if i % 5 == 0:
+                save_occurrence_store(occurrence_store)
+                save_seen_jobs(seen_jobs)
+
+            # Be polite to the API between calls
+            time.sleep(0.5)
+    finally:
+        out_file.close()
+        filtered_file.close()
+        save_occurrence_store(occurrence_store)
+        save_seen_jobs(seen_jobs)
 
     print(f"\nDone. problem_library CSV written to: {output_path}")
+    print(f"Posts filtered out as not automation-relevant ({filtered_count}): {filtered_out_path}")
     print(f"Running problem_occurrence counts saved to: {OCCURRENCE_STORE_PATH}")
+    print(f"Seen-job dedup list saved to: {SEEN_JOBS_STORE_PATH}")
     print_summary(enriched_rows)
 
 
