@@ -1,0 +1,47 @@
+{
+ "$schema": "http://json-schema.org/draft-07/schema#",
+ "type": "object",
+ "required": ["post_type","is_relevant","relevance_reason","relevance_span","problems"],
+ "properties": {
+  "post_type": {"enum": ["operational_problem","tech_request_no_problem","one_off_task","consulting_or_strategy","vague","spam","other"]},
+  "is_relevant": {"type": "boolean"},
+  "relevance_reason": {"type": "string"},
+  "relevance_span": {"type": ["string","null"], "maxLength": 200},
+  "client_ask": {"type": ["string","null"]},
+  "industry_stated": {"type": ["string","null"]},
+  "problems": {"type": "array", "maxItems": 3, "items": {
+    "type": "object",
+    "required": ["role","problem_statement","workflow_object","pain_type","recurrence","evidence_items"],
+    "properties": {
+     "role": {"enum": ["primary","secondary"]},
+     "problem_statement": {"type": "string"},
+     "workflow_object": {"type": "string"},
+     "pain_type": {"enum": ["delay","error","volume","cost","visibility","inconsistency","missed_opportunity","other"]},
+     "recurrence": {"type": "object", "required": ["level"], "properties": {
+        "level": {"enum": ["explicit","implied","none"]}, "span": {"type": ["string","null"]}}},
+     "freq":   {"type": ["object","null"], "properties": {"value":{"type":"string"},"span":{"type":"string"}}},
+     "time":   {"type": ["object","null"], "properties": {"value":{"type":"string"},"span":{"type":"string"}}},
+     "impact": {"type": ["object","null"], "properties": {"value":{"type":"string"},"span":{"type":"string"}}},
+     "causes":       {"type": "array", "items": {"$ref": "#/definitions/claim"}},
+     "consequences": {"type": "array", "items": {"$ref": "#/definitions/claim"}},
+     "current_handler": {"enum": ["owner","employee","assistant","contractor","tool","nobody","unknown"]},
+     "current_solution": {"type": ["string","null"]},
+     "tools": {"type": "array", "items": {"type": "string"}},
+     "hiring_type": {"enum": ["replacing_labor","upgrading_process","new_capability","unclear"]},
+     "spending_observed": {"enum": ["none","hiring_human","paying_for_tool","stated_budget_for_fix"]},
+     "buyer_intent_observed": {"enum": ["none","vague_interest","active_request","explicit_scope_and_budget"]},
+     "buyer_role": {"type": ["object","null"], "properties": {"role": {"enum": ["owner","manager","ops","unknown"]}, "span": {"type": ["string","null"]}}},
+     "automation_fit": {"enum": ["high","medium","low","none"]},
+     "automation_fit_reason": {"type": "string"},
+     "automation_inappropriate": {"type": "boolean"},
+     "solution_modes": {"type": "array", "items": {"enum": ["process_fix","no_code_automation","custom_code","website_or_form","llm_component","hire_human","none"]}},
+     "required_capabilities": {"type": "array", "items": {"type": "string"}},
+     "missing_info": {"type": "array", "items": {"type": "string"}},
+     "pattern": {"type": "object", "properties": {"existing_id": {"type": ["string","null"]}, "proposed_name": {"type": ["string","null"]}, "reason": {"type": "string"}}},
+     "evidence_items": {"type": "array", "maxItems": 5, "items": {"type": "object", "required": ["field","span","kind"],
+        "properties": {"field": {"type": "string"}, "span": {"type": "string", "maxLength": 200}, "kind": {"enum": ["observation","inference"]}}}}
+    }}}
+ },
+ "definitions": {"claim": {"type": "object", "required": ["text","kind"],
+   "properties": {"text": {"type": "string"}, "span": {"type": ["string","null"]}, "kind": {"enum": ["observation","inference"]}}}}
+}
