@@ -31,7 +31,7 @@ Files: `prompts_v3.py` (S8, S9), `schema_v3.json` (S7), `validate.py` (S10, `val
 9. Filtered CSV opened `"w"` each run. Old filtered rows lost.
 10. `--fresh` double-counts occurrences.
 11. Hardcoded `F:\` path. Breaks in Docker. Stores vanish.
-12. API key in `config_example.py`. Rotate.
+12. API key in `config.py`. Rotate.
 13. README stale (Claude, P1, LEAD_TYPE).
 
 ## S4 Root causes

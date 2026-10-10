@@ -4,4 +4,4 @@
 #
 # Get your key at: https://console.groq.com/keys
 
-GROQ_API_KEY = "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"
+GROQ_API_KEY = "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"

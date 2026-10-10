@@ -1,742 +1,386 @@
-#!/usr/bin/env python3
 """
-Upwork Problem-Discovery Extractor
------------------------------------
-Implements Build Order Steps 1-2 of the Problem Discovery & AI/Automation Lead
-Generation plan:
-  Step 1: problem_library schema (provenance, hiring_type, task_frequency,
-          problem_occurrence, etc.)
-  Step 2: AI extraction prompt with hard gate + hiring_type weighting
+extract.py  (v3 runner)
 
-Reads a CSV of raw Upwork job posts (job_title, job_description, job_url,
-client_payment_verified, client_total_spend, date_posted), sends each row to
-an LLM for problem extraction, applies a hard-gate confidence cap IN CODE
-(never trust the model alone for this), adds code-generated provenance
-fields, tracks problem_occurrence across runs over time, and writes a
-problem_library-shaped CSV.
+CSV of Upwork posts -> Groq -> validate_post() -> SQLite + CSV/JSONL outputs.
 
-This script does NOT search or scrape Upwork - per the plan (Section 4),
-Upwork's job-search API requires approval and general scraping violates
-Upwork's ToS. Job posts must be collected manually (or via an approved API)
-and placed in the input CSV before running this script.
+Needs these files in the SAME folder:
+    prompts_v3.py, schema_v3.json, scoring.py, normalize.py
+    validate.py   <- your "validate (1).py" renamed (Python cannot import a name with spaces)
 
 Usage:
-    python3 extract.py
-    (it will prompt you for the input CSV path)
+    python extract.py input.csv
+    python extract.py input.csv --out-dir OutPutCsv --limit 5
+    python extract.py            (prompts for the CSV path)
 
-    or
+Input CSV columns:
+    required: job_title, job_description
+    optional: post_id, client_key (or client_id), date_posted, job_url, source_type
+    If post_id is missing it is generated (sample-001 style).
+    If client_key is missing the client is "unknown" and is NEVER counted as unique.
+"""
+import argparse, csv, datetime, json, os, sqlite3, sys, time, traceback
+from collections import Counter
 
-    python3 extract.py /path/to/input.csv
-    python3 extract.py /path/to/input.csv /path/to/output.csv
+try:
+    from prompts_v3 import (SYSTEM_PROMPT, USER_TEMPLATE, WORKFLOW_OBJECTS, PROMPT_VERSION)
+    from normalize import SEED_PATTERNS
+    import validate as V
+    from validate import validate_post, body_sha1, truncate_body, is_near_dup
+except ImportError as e:
+    sys.exit(f"Import failed: {e}\nCheck that prompts_v3.py, normalize.py, scoring.py and validate.py "
+             f"(renamed from 'validate (1).py') are in the same folder as extract.py.")
 
-Requires:
-    GROQ_API_KEY environment variable set (or config_example.py / config.py
-    next to this script with GROQ_API_KEY set).
+HERE = os.path.dirname(os.path.abspath(__file__))
+MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+SCHEMA_VERSION = "v3"
+MAX_ATTEMPTS = 3
+MAX_CONSECUTIVE_FAILS = 3
+CAPABILITY_CATALOG = {}          # id -> difficulty 1-5. Empty until you define one.
+
+# ------------------------------------------------------------------ setup
+def get_api_key():
+    key = os.environ.get("GROQ_API_KEY")
+    if not key:
+        try:
+            import config
+            key = config.GROQ_API_KEY
+        except Exception:
+            key = None
+    if not key or "your-key" in key.lower():
+        sys.exit("No Groq key. Set the GROQ_API_KEY environment variable (do not put it in files you share).")
+    return key
+
+def load_schema_text():
+    p = os.path.join(HERE, "schema_v3.json")
+    if not os.path.exists(p):
+        sys.exit("schema_v3.json not found next to extract.py")
+    with open(p, encoding="utf-8") as f:
+        raw = f.read()
+    return raw, json.loads(raw)
+
+DB_SCHEMA = """
+CREATE TABLE IF NOT EXISTS raw_posts (
+  post_id TEXT PRIMARY KEY, source_type TEXT, source_url TEXT, client_key TEXT, title TEXT, body TEXT,
+  body_sha1 TEXT, date_posted TEXT, date_collected TEXT, dup_of TEXT, copied_template INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS observations (
+  obs_id INTEGER PRIMARY KEY AUTOINCREMENT, post_id TEXT, run_id TEXT, model TEXT, prompt_version TEXT,
+  schema_version TEXT, post_type TEXT, is_relevant INTEGER, relevance_reason TEXT, client_ask TEXT,
+  industry_stated TEXT, post_errors TEXT, attempts INTEGER, json_first_try INTEGER, error TEXT, raw_json TEXT);
+CREATE TABLE IF NOT EXISTS problems (
+  problem_id INTEGER PRIMARY KEY AUTOINCREMENT, obs_id INTEGER, post_id TEXT, problem_idx INTEGER, role TEXT,
+  problem_statement TEXT, workflow_object TEXT, pain_type TEXT, evidence_grade TEXT, automation_fit TEXT,
+  spending_observed TEXT, hiring_type TEXT, needs_review INTEGER, scores_json TEXT, problem_json TEXT);
+CREATE TABLE IF NOT EXISTS patterns (
+  pattern_id TEXT PRIMARY KEY, family_id TEXT, definition TEXT, same_prototype_test TEXT, status TEXT);
+CREATE TABLE IF NOT EXISTS pattern_assignments (
+  problem_id INTEGER, pattern_id TEXT, proposed_name TEXT, method TEXT, similarity REAL, reviewed INTEGER);
+CREATE VIEW IF NOT EXISTS problem_metrics AS
+SELECT a.pattern_id AS pattern_id,
+  COUNT(DISTINCT p.post_id) AS posts,
+  COUNT(DISTINCT p.client_key) AS unique_clients,
+  COUNT(DISTINCT CASE WHEN pr.spending_observed IN ('hiring_human','paying_for_tool','stated_budget_for_fix')
+        THEN p.client_key END) AS clients_with_spending,
+  SUM(CASE WHEN pr.evidence_grade IN ('A','B') THEN 1 ELSE 0 END) AS strong_obs,
+  MIN(p.date_posted) AS first_seen, MAX(p.date_posted) AS last_seen
+FROM pattern_assignments a
+JOIN problems pr ON pr.problem_id = a.problem_id
+JOIN observations o ON o.obs_id = pr.obs_id
+JOIN raw_posts p ON p.post_id = o.post_id
+WHERE o.is_relevant = 1 AND p.dup_of IS NULL AND a.pattern_id IS NOT NULL AND a.reviewed IN (0,1)
+GROUP BY a.pattern_id;
 """
 
-import os
-import re
-import sys
-import json
-import time
-import hashlib
-import datetime
-import csv as csv_module
+def open_db(path):
+    con = sqlite3.connect(path)
+    con.executescript(DB_SCHEMA)
+    for pid, fam, definition, test in SEED_PATTERNS:
+        con.execute("INSERT OR IGNORE INTO patterns VALUES (?,?,?,?,?)", (pid, fam, definition, test, "active"))
+    con.commit()
+    return con
 
-import pandas as pd
-from groq import Groq, APIError, APIStatusError
+# ------------------------------------------------------------------ input
+def read_rows(path):
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        rows = list(csv.DictReader(f))
+    if not rows:
+        sys.exit("Input CSV is empty.")
+    missing = [c for c in ("job_title", "job_description") if c not in rows[0]]
+    if missing:
+        sys.exit(f"Input CSV is missing required columns: {missing}. Found: {list(rows[0].keys())}")
+    out = []
+    for i, r in enumerate(rows, 1):
+        out.append({
+            "post_id": (r.get("post_id") or "").strip() or f"sample-{i:03d}",
+            "client_key": (r.get("client_key") or r.get("client_id") or "").strip() or None,
+            "title": (r.get("job_title") or "").strip(),
+            "body": (r.get("job_description") or "").strip(),
+            "date_posted": (r.get("date_posted") or "").strip(),
+            "source_url": (r.get("job_url") or "").strip(),
+            "source_type": (r.get("source_type") or "upwork").strip(),
+            "_orig": r,
+        })
+    return out
 
-from prompts import SYSTEM_PROMPT, USER_TEMPLATE
-
-# Groq deprecated llama-3.3-70b-versatile on the free/developer tier.
-# openai/gpt-oss-120b is their recommended replacement - strong quality,
-# fast inference. Swap for another model name from console.groq.com/docs/models
-# if you want (e.g. openai/gpt-oss-20b for a faster/cheaper run).
-MODEL = "openai/gpt-oss-120b"
-MAX_RETRIES = 3
-RETRY_BACKOFF_SECONDS = 5
-
-# gpt-oss is a reasoning model: it burns tokens on internal "thinking" before
-# writing the final JSON answer, and those thinking tokens count against
-# max_tokens. Give it a big budget and hide/limit the reasoning so it doesn't
-# eat the space meant for the actual answer.
-MAX_TOKENS = 4000
-REASONING_EFFORT = "low"       # low | medium | high
-REASONING_FORMAT = "hidden"    # hidden | parsed | raw
-
-# Where enriched CSVs land by default (used when no output path is given
-# on the command line). Change this path if you move the project folder.
-DEFAULT_OUTPUT_DIR = r"F:\AI automation\Up_work_Leads\main Project\UpWork\Python_File\OutPutCsv"
-
-# Where the running problem_occurrence counts are stored, so this pattern-
-# frequency signal accumulates across every batch you run over time, not
-# just within a single 15-row file (a single small batch can't tell you
-# "17 posts this month" on its own).
-OCCURRENCE_STORE_PATH = os.path.join(DEFAULT_OUTPUT_DIR, "problem_occurrence_counts.json")
-
-# Suffix for the sidecar CSV that captures posts the relevance gate rejected
-# (is_automation_relevant = false) - kept separate from problem_library so a
-# "design me a logo" post never pollutes the real pipeline, but nothing is
-# silently thrown away either; you can audit what got filtered and why.
-FILTERED_OUT_PATH_SUFFIX = "_filtered_out.csv"
-
-# Tracks every source_job_id ever processed, across every batch/run. Without
-# this, running the same CSV twice (or two weekly batches that happen to
-# overlap on a job post) silently inflates problem_occurrence counts with
-# duplicate posts, which corrupts the "market-wide demand" signal the plan
-# relies on.
-SEEN_JOBS_STORE_PATH = os.path.join(DEFAULT_OUTPUT_DIR, "seen_job_ids.json")
-
-# Rate limits (429s) are different from a bad/truncated response: they mean
-# "you've used up your tokens-per-minute quota, slow down" rather than
-# "something is wrong with this request." For those specifically, wait much
-# longer and escalate each time, since retrying quickly just gets another 429.
-RATE_LIMIT_BACKOFF_SECONDS = [200, 300, 450, 600]  # 1st, 2nd, 3rd, 4th+ rate-limit hit
-RATE_LIMIT_MAX_RETRIES = len(RATE_LIMIT_BACKOFF_SECONDS)
-
-REQUIRED_INPUT_COLUMNS = [
-    "job_title",
-    "job_description",
-    "job_url",
-    "client_payment_verified",
-    "client_total_spend",
-    "date_posted",
-]
-
-# Fields the LLM is responsible for producing (see prompts.py SYSTEM_PROMPT).
-LLM_FIELDS = [
-    "evidence",
-    "extracted_problem",
-    "industry",
-    "problem_pattern",
-    "hiring_type",
-    "task_frequency",
-    "time_cost",
-    "business_impact",
-    "current_solution",
-    "tools_involved",
-    "urgency",
-    "problem_confidence",
-    "confidence_reason",
-    "automation_fit",
-    "solution_type",
-]
-
-# Fields generated in code (provenance + cross-batch signals), never by the
-# LLM - these should never be hallucinated.
-CODE_FIELDS = [
-    "id",
-    "source",
-    "source_url",
-    "source_job_id",
-    "date_collected",
-    "client_spend_signal",
-    "problem_occurrence",
-]
-
-# Full problem_library schema, in the order it should appear in the output.
-ANALYSIS_COLUMNS = [
-    "id",
-    "source",
-    "source_url",
-    "source_job_id",
-    "date_collected",
-    "evidence",
-    "extracted_problem",
-    "industry",
-    "problem_pattern",
-    "hiring_type",
-    "task_frequency",
-    "problem_occurrence",
-    "time_cost",
-    "business_impact",
-    "current_solution",
-    "tools_involved",
-    "urgency",
-    "problem_confidence",
-    "confidence_reason",
-    "automation_fit",
-    "solution_type",
-    "client_spend_signal",
-]
-
-# Fields whose presence (a real, quantified value) counts as "quantified
-# evidence" for the hard gate. Plain non-empty text isn't enough - we also
-# require at least one digit, since "a lot" or "frequently" is not a
-# quantified figure.
-QUANTIFICATION_FIELDS = ["task_frequency", "time_cost", "business_impact"]
-
-HIRING_TYPE_LABOR = "replacing human labor"
-HIRING_TYPE_CURIOSITY = "exploring AI/tech upgrade"
-CONFIDENCE_ORDER = {"Low": 0, "Medium": 1, "High": 2}
-
-
-def is_empty(value) -> bool:
-    if value is None:
-        return True
-    s = str(value).strip().lower()
-    return s in ("", "null", "none", "n/a", "na")
-
-
-# prompts.py explicitly tells the model task_frequency can be a bare cadence
-# word like "daily" with no digit in it (see SYSTEM_PROMPT's own example).
-# The old digit-only check didn't recognize that, so a fully-described daily
-# task with no other numbers got silently treated as unquantified and its
-# confidence got capped to Low even though the model's reasoning (correctly)
-# said otherwise. Recognize named cadences as quantified too.
-NAMED_CADENCE_RE = re.compile(
-    r"\b(daily|weekly|monthly|yearly|annually|hourly|nightly|"
-    r"every\s+(day|night|week|month|shift|order|call|hour)|"
-    r"per\s+(day|night|week|month|shift|order|call|hour))\b",
-    re.IGNORECASE,
-)
-
-
-def is_quantified(value) -> bool:
-    """A field counts as quantified evidence if it has real text AND either
-    contains a digit (a number, frequency, or amount) or names a concrete
-    recurring cadence (daily, weekly, every shift, ...). Vague words like
-    "often", "a lot", or "regularly" still do not count."""
-    if is_empty(value):
-        return False
-    s = str(value)
-    return bool(re.search(r"\d", s)) or bool(NAMED_CADENCE_RE.search(s))
-
-
-def get_client() -> Groq:
-    api_key = os.environ.get("GROQ_API_KEY")
-
-    if not api_key:
-        # Fall back to config_example.py / config.py sitting next to this
-        # script, so you don't have to set an env var every session.
-        for module_name in ("config", "config_example"):
-            try:
-                config = __import__(module_name)
-                api_key = getattr(config, "GROQ_API_KEY", None)
-                if api_key:
-                    break
-            except ImportError:
-                continue
-
-    if not api_key or api_key == "gsk_paste_your_real_key_here":
-        print("ERROR: no Groq API key found.")
-        print("Either:")
-        print("  1) set it for this session:  $env:GROQ_API_KEY=\"gsk_your_real_key\"")
-        print("  2) or open config_example.py and paste your real key in there")
-        print("Get a key at: https://console.groq.com/keys")
-        sys.exit(1)
-
-    return Groq(api_key=api_key)
-
-
-def _print_raw_error_body(e):
-    """Best-effort dump of the raw HTTP response so a failure is actually
-    debuggable instead of showing an empty failed_generation."""
-    try:
-        body = e.response.text
-        if body:
-            print(f"  Raw response body (first 1000 chars): {body[:1000]}")
-    except Exception:
-        pass
-
-
-def call_model(client: Groq, row: dict) -> dict:
-    user_message = USER_TEMPLATE.format(
-        job_title=row.get("job_title", ""),
-        job_description=row.get("job_description", ""),
-        client_payment_verified=row.get("client_payment_verified", ""),
-        client_total_spend=row.get("client_total_spend", ""),
-        date_posted=row.get("date_posted", ""),
+# ------------------------------------------------------------------ model call
+def build_messages(post, body, truncated, system_text, vocab_text):
+    user = USER_TEMPLATE.format(
+        workflow_objects=", ".join(WORKFLOW_OBJECTS),
+        pattern_vocabulary=vocab_text,
+        capability_catalog=", ".join(CAPABILITY_CATALOG) or "none defined",
+        post_id=post["post_id"],
+        date_posted=post["date_posted"] or "unknown",
+        body_truncated=str(truncated).lower(),
+        job_title=post["title"],
+        job_description=body,
     )
+    return [{"role": "system", "content": system_text}, {"role": "user", "content": user}]
 
-    last_error = None
-    rate_limit_hits = 0  # separate counter, does not consume normal MAX_RETRIES
-
-    attempt = 1
-    while attempt <= MAX_RETRIES:
+def shape_error(res, schema):
+    """Return None if res is acceptable, else a short reason string."""
+    try:
+        import jsonschema
         try:
-            kwargs = dict(
-                model=MODEL,
-                max_tokens=MAX_TOKENS,
-                temperature=0.2,
+            jsonschema.validate(res, schema)
+            return None
+        except jsonschema.ValidationError as e:
+            return f"schema: {e.message[:150]}"
+    except ImportError:
+        pass
+    if not isinstance(res, dict): return "not an object"
+    for k in ("post_type", "is_relevant", "relevance_reason", "problems"):
+        if k not in res: return f"missing key {k}"
+    if not isinstance(res["problems"], list): return "problems not a list"
+    return None
+
+def call_model(client, messages, schema):
+    """Returns (result_dict|None, attempts, first_try_ok, error|None)."""
+    last_err = None
+    msgs = list(messages)
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            resp = client.chat.completions.create(
+                model=MODEL, messages=msgs, temperature=0, max_completion_tokens=6000,
                 response_format={"type": "json_object"},
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_message},
-                ],
-            )
+                extra_body={"reasoning_effort": "low"})
+            text = resp.choices[0].message.content or ""
+            res = json.loads(text)
+            bad = shape_error(res, schema)
+            if bad is None:
+                return res, attempt, attempt == 1, None
+            last_err = bad
+            msgs = messages + [{"role": "user", "content":
+                f"Your previous output was invalid ({bad}). Return ONLY a corrected JSON object matching the schema."}]
+        except json.JSONDecodeError as e:
+            last_err = f"bad_json: {e}"
+            msgs = messages + [{"role": "user", "content":
+                "Your previous output was not valid JSON. Return ONLY one valid JSON object."}]
+        except Exception as e:            # network / rate limit / API error
+            last_err = f"{type(e).__name__}: {str(e)[:200]}"
+            wait = 20 if "429" in str(e) or "rate" in str(e).lower() else 2 * attempt
+            time.sleep(wait)
+    return None, MAX_ATTEMPTS, False, last_err
 
-            # reasoning_effort / reasoning_format are gpt-oss-specific params.
-            # Older groq SDK versions may not accept them - if you hit a
-            # TypeError about an unexpected keyword argument, upgrade the
-            # groq package (`pip install -U groq`) or just delete these two
-            # lines and rely on the higher MAX_TOKENS alone.
-            if REASONING_EFFORT:
-                kwargs["reasoning_effort"] = REASONING_EFFORT
-            if REASONING_FORMAT:
-                kwargs["reasoning_format"] = REASONING_FORMAT
+# ------------------------------------------------------------------ storage
+def save_post(con, post, body_hash, dup_of, copied):
+    con.execute("INSERT OR REPLACE INTO raw_posts VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (post["post_id"], post["source_type"], post["source_url"], post["client_key"], post["title"],
+         post["body"], body_hash, post["date_posted"], datetime.date.today().isoformat(), dup_of, int(copied)))
 
-            response = client.chat.completions.create(**kwargs)
-            text = response.choices[0].message.content.strip()
-
-            # Strip accidental markdown fences if the model adds them anyway
-            if text.startswith("```"):
-                text = text.strip("`")
-                if text.startswith("json"):
-                    text = text[4:]
-                text = text.strip()
-
-            if not text:
-                raise ValueError("Model returned empty content (likely truncated / all tokens spent on reasoning)")
-
-            return json.loads(text)
-
-        except (APIError, APIStatusError) as e:
-            last_error = e
-            status_code = getattr(e, "status_code", None)
-
-            if status_code == 429:
-                # Rate limit: don't burn a normal retry on this. Wait a long,
-                # escalating amount of time instead, since retrying quickly
-                # will just get another 429.
-                idx = min(rate_limit_hits, RATE_LIMIT_MAX_RETRIES - 1)
-                wait_seconds = RATE_LIMIT_BACKOFF_SECONDS[idx]
-                rate_limit_hits += 1
-                print(f"  Rate limited (429). Waiting {wait_seconds}s before retrying "
-                      f"(rate-limit hit #{rate_limit_hits})...")
-                _print_raw_error_body(e)
-                time.sleep(wait_seconds)
-
-                if rate_limit_hits >= RATE_LIMIT_MAX_RETRIES:
-                    raise RuntimeError(
-                        f"Still rate limited after {rate_limit_hits} escalating waits: {e}"
-                    )
-                continue  # retry this same row without counting it against attempt
-
-            print(f"  API error on attempt {attempt}/{MAX_RETRIES}: {e}")
-            _print_raw_error_body(e)
-            time.sleep(RETRY_BACKOFF_SECONDS * attempt)
-        except (json.JSONDecodeError, ValueError) as e:
-            last_error = e
-            print(f"  JSON parse error on attempt {attempt}/{MAX_RETRIES}: {e}")
-            time.sleep(RETRY_BACKOFF_SECONDS)
-
-        attempt += 1
-
-    raise RuntimeError(f"Failed after {MAX_RETRIES} attempts: {last_error}")
-
-
-def apply_hard_gate(analysis: dict) -> dict:
-    """Enforce, IN CODE, the rules from Section 4 of the plan:
-      - No quantified task_frequency / time_cost / business_impact ->
-        problem_confidence auto-caps at Low.
-      - hiring_type weighting: "exploring AI/tech upgrade" posts default to
-        a lower confidence ceiling than "replacing human labor" posts unless
-        evidence is fully quantified, per Section 4's "lower default
-        confidence unless evidence is quantified" rule.
-    This never upgrades the model's own confidence - only downgrades it.
-    """
-    # Validate hiring_type against the enum the prompt promises. If the model
-    # drifts (different wording/casing), the "==" checks below would silently
-    # never match and the curiosity-specific cap would never fire. Normalize
-    # instead of trusting it blindly.
-    hiring_type = analysis.get("hiring_type")
-    if hiring_type not in (HIRING_TYPE_LABOR, HIRING_TYPE_CURIOSITY):
-        normalized = str(hiring_type or "").strip().lower()
-        if "labor" in normalized or "hire" in normalized or "hiring" in normalized:
-            hiring_type = HIRING_TYPE_LABOR
+def save_observation(con, post, res, run_id, attempts, first_ok, error, vocab_ids):
+    cur = con.execute(
+        "INSERT INTO observations (post_id,run_id,model,prompt_version,schema_version,post_type,is_relevant,"
+        "relevance_reason,client_ask,industry_stated,post_errors,attempts,json_first_try,error,raw_json) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (post["post_id"], run_id, MODEL, PROMPT_VERSION, SCHEMA_VERSION,
+         (res or {}).get("post_type"),
+         None if not res or res.get("is_relevant") is None else int(bool(res["is_relevant"])),
+         (res or {}).get("relevance_reason"), (res or {}).get("client_ask"), (res or {}).get("industry_stated"),
+         json.dumps((res or {}).get("post_errors", [])), attempts, int(first_ok), error,
+         json.dumps(res, ensure_ascii=False) if res else None))
+    obs_id = cur.lastrowid
+    review_rows = []
+    for idx, p in enumerate((res or {}).get("problems") or []):
+        pc = con.execute(
+            "INSERT INTO problems (obs_id,post_id,problem_idx,role,problem_statement,workflow_object,pain_type,"
+            "evidence_grade,automation_fit,spending_observed,hiring_type,needs_review,scores_json,problem_json) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (obs_id, post["post_id"], idx, p.get("role"), p.get("problem_statement"), p.get("workflow_object"),
+             p.get("pain_type"), p.get("evidence_grade"), p.get("automation_fit"), p.get("spending_observed"),
+             p.get("hiring_type"), int(bool(p.get("needs_review"))), json.dumps(p.get("scores", {})),
+             json.dumps(p, ensure_ascii=False)))
+        pid = pc.lastrowid
+        pat = p.get("pattern") or {}
+        existing = pat.get("existing_id")
+        if existing and existing in vocab_ids:
+            # LLM chose a vocabulary pattern. No embedder yet, so mark unreviewed (still counted).
+            con.execute("INSERT INTO pattern_assignments VALUES (?,?,?,?,?,?)", (pid, existing, None, "llm", None, 0))
         else:
-            hiring_type = HIRING_TYPE_CURIOSITY
-        analysis["hiring_type"] = hiring_type
+            proposed = V_snake(pat.get("proposed_name"))
+            con.execute("INSERT INTO pattern_assignments VALUES (?,?,?,?,?,?)", (pid, None, proposed, "llm_proposed", None, 2))
+            review_rows.append({"post_id": post["post_id"], "problem_idx": idx, "proposed_pattern": proposed,
+                                "reason": pat.get("reason", ""), "problem_statement": p.get("problem_statement", "")})
+    con.commit()
+    return review_rows
 
-    quantified_count = sum(1 for f in QUANTIFICATION_FIELDS if is_quantified(analysis.get(f)))
-    fully_quantified = quantified_count == len(QUANTIFICATION_FIELDS)
-    any_quantified = quantified_count > 0
-
-    original_confidence = analysis.get("problem_confidence")
-    confidence = original_confidence
-    if confidence not in CONFIDENCE_ORDER:
-        confidence = "Low"  # unrecognized/missing value - treat as worst case
-
-    def cap(value, ceiling):
-        if CONFIDENCE_ORDER.get(value, 0) > CONFIDENCE_ORDER[ceiling]:
-            return ceiling
-        return value
-
-    gate_note = None
-
-    # Base hard gate: zero quantified evidence at all -> Low, no exceptions.
-    if not any_quantified:
-        new_confidence = cap(confidence, "Low")
-        if new_confidence != confidence:
-            gate_note = ("Hard gate applied: no quantified task_frequency, "
-                         "time_cost, or business_impact was found, so confidence "
-                         f"was capped from {confidence} to {new_confidence}.")
-        confidence = new_confidence
-    # hiring_type weighting: curiosity/exploratory posts need FULL
-    # quantification to earn anything above Medium; partial quantification
-    # only earns Medium at most. "Replacing human labor" posts are proven,
-    # funded pain, so partial quantification is enough to reach Medium/High
-    # based on the model's own judgement.
-    elif hiring_type == HIRING_TYPE_CURIOSITY and not fully_quantified:
-        new_confidence = cap(confidence, "Medium")
-        if new_confidence != confidence:
-            gate_note = ("Hard gate applied: hiring_type is 'exploring AI/tech "
-                         "upgrade' without full quantification, so confidence "
-                         f"was capped from {confidence} to {new_confidence}.")
-        confidence = new_confidence
-
-    analysis["problem_confidence"] = confidence
-
-    # Keep confidence_reason honest. Previously the model's original reasoning
-    # (which could argue for a HIGHER confidence than the gate allows) was left
-    # untouched, so the stored reason and the final label could contradict
-    # each other. Append, don't discard - the model's reasoning is still
-    # useful context for a human reviewer.
-    if gate_note:
-        existing_reason = analysis.get("confidence_reason") or ""
-        analysis["confidence_reason"] = (
-            f"{existing_reason.strip()} {gate_note}".strip()
-        )
-
-    # If confidence got capped to Low, automation_fit claims of "High" are
-    # also suspect - the underlying problem itself is not well-established
-    # yet, so don't let a strong automation_fit rating stand unchallenged.
-    if confidence == "Low" and analysis.get("automation_fit") == "High":
-        analysis["automation_fit"] = "Medium"
-
-    # Validate solution_type against the allowed enum so a hallucinated or
-    # malformed category never silently reaches the CSV.
-    allowed_solutions = {"AI", "Automation", "Website"}
-    solution_type = analysis.get("solution_type")
-    if isinstance(solution_type, list):
-        cleaned = [s for s in solution_type if s in allowed_solutions]
-        analysis["solution_type"] = cleaned or ["Automation"]
-    elif solution_type not in allowed_solutions:
-        analysis["solution_type"] = ["Automation"]
-
-    return analysis
-
-
-def make_source_job_id(job_url: str, job_title: str) -> str:
-    """Try to pull Upwork's own job id out of the URL (e.g. the ~0123abc...
-    segment). Falls back to a short stable hash of url+title so every row
-    still gets a consistent, deterministic id even without a clean URL."""
-    if job_url:
-        match = re.search(r"~[0-9a-fA-F]{10,}", job_url)
-        if match:
-            return match.group(0)
-        match = re.search(r"/jobs/([\w-]+)", job_url)
-        if match:
-            return match.group(1)
-    basis = f"{job_url}|{job_title}".encode("utf-8", errors="ignore")
-    return "h" + hashlib.sha1(basis).hexdigest()[:16]
-
-
-def load_occurrence_store() -> dict:
-    if os.path.isfile(OCCURRENCE_STORE_PATH):
-        try:
-            with open(OCCURRENCE_STORE_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, OSError):
-            print(f"  WARNING: could not read {OCCURRENCE_STORE_PATH}, starting fresh.")
-    return {}
-
-
-def save_occurrence_store(store: dict):
-    os.makedirs(os.path.dirname(OCCURRENCE_STORE_PATH), exist_ok=True)
-    with open(OCCURRENCE_STORE_PATH, "w", encoding="utf-8") as f:
-        json.dump(store, f, indent=2, sort_keys=True)
-
-
-def load_seen_jobs() -> set:
-    if os.path.isfile(SEEN_JOBS_STORE_PATH):
-        try:
-            with open(SEEN_JOBS_STORE_PATH, "r", encoding="utf-8") as f:
-                return set(json.load(f))
-        except (json.JSONDecodeError, OSError):
-            print(f"  WARNING: could not read {SEEN_JOBS_STORE_PATH}, starting fresh.")
-    return set()
-
-
-def save_seen_jobs(seen: set):
-    os.makedirs(os.path.dirname(SEEN_JOBS_STORE_PATH), exist_ok=True)
-    with open(SEEN_JOBS_STORE_PATH, "w", encoding="utf-8") as f:
-        json.dump(sorted(seen), f, indent=2)
-
-
-def normalize_problem_pattern(problem_pattern: str) -> str:
-    """Normalize the model's problem_pattern label to lower_snake_case so
-    minor formatting differences ("Lead Follow-Up Delay" vs
-    "lead_follow_up_delay") don't fragment the count. This does NOT solve
-    genuine semantic drift (the model calling the same real-world pattern
-    two different names across posts) - that needs either a controlled
-    vocabulary you maintain over time, or an embeddings-based similarity
-    match once volume justifies the added complexity. This is the
-    string-level normalization half of that fix."""
-    if is_empty(problem_pattern):
-        return "unclassified_problem"
-    s = str(problem_pattern).strip().lower()
-    s = re.sub(r"[^a-z0-9]+", "_", s)
-    s = re.sub(r"_+", "_", s).strip("_")
+def V_snake(s):
+    import re
+    s = re.sub(r"[^a-z0-9]+", "_", (s or "").lower()).strip("_")
     return s or "unclassified_problem"
 
-
-def occurrence_key(problem_pattern: str) -> str:
-    """Groups by the normalized problem_pattern itself - e.g.
-    "lead_follow_up_delay" - so the count reflects how many Upwork posts
-    have exhibited THIS problem, regardless of which industry it showed up
-    in, per the plan's definition: 'how often this problem pattern appears
-    across Upwork posts' (e.g. 17 relevant posts this month)."""
-    return normalize_problem_pattern(problem_pattern)
-
-
-def add_provenance_and_occurrence(analysis: dict, row: dict, occurrence_store: dict, row_index: int) -> dict:
-    analysis["id"] = row_index
-    analysis["source"] = "upwork"
-    analysis["source_url"] = row.get("job_url", "")
-    analysis["source_job_id"] = make_source_job_id(row.get("job_url", ""), row.get("job_title", ""))
-    analysis["date_collected"] = datetime.date.today().isoformat()
-    analysis["client_spend_signal"] = row.get("client_total_spend", "")
-
-    # Normalize problem_pattern in place so the CSV column and the occurrence
-    # key always agree (e.g. "Lead Follow-Up Delay" -> "lead_follow_up_delay").
-    analysis["problem_pattern"] = normalize_problem_pattern(analysis.get("problem_pattern"))
-
-    key = occurrence_key(analysis["problem_pattern"])
-    occurrence_store[key] = occurrence_store.get(key, 0) + 1
-    analysis["problem_occurrence"] = occurrence_store[key]
-
-    return analysis
-
-
-def normalize_for_csv(analysis: dict) -> dict:
-    """solution_type comes back as a JSON array from the model - flatten it
-    to a readable string for the CSV cell."""
-    solution_type = analysis.get("solution_type")
-    if isinstance(solution_type, list):
-        analysis["solution_type"] = "; ".join(str(x) for x in solution_type)
-    elif solution_type is None:
-        analysis["solution_type"] = ""
-    return analysis
-
-
-def validate_row(input_row: dict) -> list:
-    missing = [c for c in REQUIRED_INPUT_COLUMNS if c not in input_row]
-    return missing
-
-
-def print_summary(enriched_rows: list):
-    total = len(enriched_rows)
-    if total == 0:
-        print("\nNo rows processed.")
-        return
-
-    high = sum(1 for r in enriched_rows if r.get("problem_confidence") == "High")
-    medium = sum(1 for r in enriched_rows if r.get("problem_confidence") == "Medium")
-    low = sum(1 for r in enriched_rows if r.get("problem_confidence") == "Low")
-
-    labor = sum(1 for r in enriched_rows if r.get("hiring_type") == HIRING_TYPE_LABOR)
-    curiosity = sum(1 for r in enriched_rows if r.get("hiring_type") == HIRING_TYPE_CURIOSITY)
-
-    high_automation_fit = sum(1 for r in enriched_rows if r.get("automation_fit") == "High")
-
-    print("\n" + "=" * 60)
-    print("FINAL SUMMARY")
-    print("=" * 60)
-    print(f"Total posts analyzed:                 {total}")
-    print(f"problem_confidence High / Medium / Low: {high} / {medium} / {low}")
-    print(f"hiring_type - replacing human labor:    {labor}")
-    print(f"hiring_type - exploring AI/tech upgrade: {curiosity}")
-    print(f"automation_fit = High:                  {high_automation_fit}")
-
-    print("\nTop rows by problem_confidence:")
-    ranked = sorted(
-        enriched_rows,
-        key=lambda r: -CONFIDENCE_ORDER.get(r.get("problem_confidence"), 0),
-    )
-    for r in ranked[:10]:
-        print(
-            f"  [{r.get('problem_confidence', '?'):6s}] "
-            f"({r.get('hiring_type', '?')}) "
-            f"- {r.get('job_title', '')[:55]}"
-        )
-    print("=" * 60)
-
-
+# ------------------------------------------------------------------ main
 def main():
-    args = sys.argv[1:]
+    ap = argparse.ArgumentParser()
+    ap.add_argument("input_csv", nargs="?")
+    ap.add_argument("--out-dir", default="OutPutCsv")
+    ap.add_argument("--db", default=None, help="SQLite path (default: <out-dir>/problem_library.db)")
+    ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--no-resume", action="store_true", help="re-analyze posts already in the DB")
+    args = ap.parse_args()
 
-    fresh = "--fresh" in args
-    if fresh:
-        args = [a for a in args if a != "--fresh"]
-        print("--fresh: ignoring seen_job_ids.json - every row will be reprocessed "
-              "and problem_occurrence counts will be re-added on top of existing ones.")
-
-    if len(args) >= 1:
-        input_path = args[0]
-    else:
-        input_path = input("Enter the path to your input CSV: ").strip().strip('"')
-
-    if not os.path.isfile(input_path):
-        print(f"ERROR: file not found: {input_path}")
-        sys.exit(1)
-
-    if len(args) >= 2:
-        output_path = args[1]
-    else:
-        base = os.path.splitext(os.path.basename(input_path))[0]
-        # Avoid "..._enriched_enriched.csv" if you accidentally run this on
-        # a file that's already an enriched output.
-        while base.endswith("_enriched"):
-            base = base[: -len("_enriched")]
-        os.makedirs(DEFAULT_OUTPUT_DIR, exist_ok=True)
-        output_path = os.path.join(DEFAULT_OUTPUT_DIR, f"{base}_enriched.csv")
-
-    filtered_out_path = os.path.splitext(output_path)[0].replace("_enriched", "") + FILTERED_OUT_PATH_SUFFIX
-
-    df = pd.read_csv(input_path, dtype=str).fillna("")
-
-    # Guard against re-running on a file that's already been enriched (e.g.
-    # you accidentally pointed this at an old output, or an output once
-    # overwrote your input). Drop any prior analysis columns - including
-    # pandas-style duplicate suffixes like problem_confidence.1, .2, etc. -
-    # and redo the analysis fresh from the original job data.
-    already_present = [
-        c for c in df.columns
-        if c in ANALYSIS_COLUMNS
-        or any(c == f"{a}.{n}" for a in ANALYSIS_COLUMNS for n in range(1, 10))
-    ]
-    if already_present:
-        print(f"NOTE: input already contains analysis columns {already_present} — "
-              f"dropping them and re-analyzing fresh (this looks like an already-enriched file).")
-        df = df.drop(columns=already_present)
-
-    input_rows = df.to_dict(orient="records")
-
-    missing_cols = validate_row(input_rows[0]) if input_rows else REQUIRED_INPUT_COLUMNS
-    if missing_cols:
-        print(f"ERROR: input CSV is missing required columns: {missing_cols}")
-        print(f"Required columns: {REQUIRED_INPUT_COLUMNS}")
-        sys.exit(1)
-
-    client = get_client()
-    occurrence_store = load_occurrence_store()
-    seen_jobs = set() if fresh else load_seen_jobs()
-
-    fieldnames = REQUIRED_INPUT_COLUMNS + [
-        c for c in df.columns if c not in REQUIRED_INPUT_COLUMNS
-    ] + ANALYSIS_COLUMNS
-
-    total = len(input_rows)
-    print(f"Processing {total} rows from {input_path} ...")
-
-    # Open the output file once and flush after every row, so a crash partway
-    # through (rate limits, a killed process, a laptop sleeping) doesn't lose
-    # every row processed so far - only the ones still to come.
-    # If the output file already has rows in it (from an earlier run this is
-    # resuming), preserve them instead of silently dropping them. Overwriting
-    # the file while skipping already-seen rows was losing those rows
-    # entirely - they existed in a *previous* output file, not this one.
-    existing_rows_by_id = {}
-    if os.path.isfile(output_path) and not fresh:
-        try:
-            existing_df = pd.read_csv(output_path, dtype=str).fillna("")
-            for rec in existing_df.to_dict(orient="records"):
-                sid = rec.get("source_job_id")
-                if sid:
-                    existing_rows_by_id[sid] = rec
-            if existing_rows_by_id:
-                print(f"Carrying forward {len(existing_rows_by_id)} previously-processed "
-                      f"row(s) from the existing output file.")
-        except Exception as e:
-            print(f"  WARNING: could not read existing output file to preserve it "
-                  f"({e}) - it will be overwritten.")
-
-    out_file = open(output_path, "w", newline="", encoding="utf-8")
-    writer = csv_module.DictWriter(out_file, fieldnames=fieldnames, quoting=csv_module.QUOTE_ALL)
-    writer.writeheader()
-    for rec in existing_rows_by_id.values():
-        writer.writerow({k: rec.get(k, "") for k in fieldnames})
-    out_file.flush()
-
-    filtered_fieldnames = ["source_job_id", "job_title", "job_url", "relevance_reason"]
-    filtered_file = open(filtered_out_path, "w", newline="", encoding="utf-8")
-    filtered_writer = csv_module.DictWriter(filtered_file, fieldnames=filtered_fieldnames, quoting=csv_module.QUOTE_ALL)
-    filtered_writer.writeheader()
-    filtered_count = 0
-
-    enriched_rows = list(existing_rows_by_id.values())
+    in_path = args.input_csv or input("Enter the path to your input CSV: ").strip().strip('"')
+    if not os.path.exists(in_path):
+        sys.exit(f"File not found: {in_path}")
+    os.makedirs(args.out_dir, exist_ok=True)
+    db_path = args.db or os.path.join(args.out_dir, "problem_library.db")
+    run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
     try:
-        for i, row in enumerate(input_rows, start=1):
-            title_preview = str(row.get("job_title", ""))[:50]
-            job_id_preview = make_source_job_id(row.get("job_url", ""), row.get("job_title", ""))
+        from groq import Groq
+    except ImportError:
+        sys.exit("pip install groq")
+    client = Groq(api_key=get_api_key())
 
-            if job_id_preview in seen_jobs:
-                print(f"[{i}/{total}] SKIPPED (already processed): {title_preview}")
+    schema_raw, schema = load_schema_text()
+    schema_min = json.dumps(json.loads(schema_raw), separators=(",", ":"))
+    system_text = SYSTEM_PROMPT + "\n\nOUTPUT JSON SCHEMA (follow exactly):\n" + schema_min
+    vocab_text = "\n".join(f"- {pid} [{fam}]: {d} | same_prototype_test: {t}" for pid, fam, d, t in SEED_PATTERNS)
+    vocab_ids = {p[0] for p in SEED_PATTERNS}
+
+    posts = read_rows(in_path)
+    if args.limit: posts = posts[:args.limit]
+    con = open_db(db_path)
+
+    done = set()
+    if not args.no_resume:
+        done = {r[0] for r in con.execute(
+            "SELECT post_id FROM observations WHERE prompt_version=? AND error IS NULL", (PROMPT_VERSION,))}
+
+    print(f"Run {run_id} | model {MODEL} | prompt {PROMPT_VERSION} | {len(posts)} posts | db {db_path}")
+    jsonl_path = os.path.join(args.out_dir, f"raw_results_{run_id}.jsonl")
+    csv_rows, review_all, seen = [], [], []
+    stats = Counter(); consecutive_fails = 0
+
+    with open(jsonl_path, "w", encoding="utf-8") as jf:
+        for n, post in enumerate(posts, 1):
+            tag = f"[{n}/{len(posts)}] {post['title'][:60]}"
+            if post["post_id"] in done:
+                print(f"{tag}\n  skipped (already analyzed)"); stats["skipped"] += 1; continue
+
+            body, truncated = truncate_body(post["body"])
+            h = body_sha1(post["body"])
+
+            # ---- dedupe against earlier posts in this run / DB
+            dup_of, copied = None, False
+            for pid, ck, b in seen:
+                if h == body_sha1(b) or is_near_dup(post["body"], b):
+                    if post["client_key"] and ck == post["client_key"]:
+                        dup_of = pid
+                    else:
+                        copied = True
+                    break
+            seen.append((post["post_id"], post["client_key"], post["body"]))
+            save_post(con, post, h, dup_of, copied)
+            if dup_of:
+                print(f"{tag}\n  duplicate of {dup_of} (same client): not sent to model")
+                stats["dup"] += 1; continue
+
+            # ---- model call
+            msgs = build_messages(post, body, truncated, system_text, vocab_text)
+            print(tag)
+            res, attempts, first_ok, err = call_model(client, msgs, schema)
+            stats["calls"] += 1; stats["first_try_ok"] += int(first_ok)
+
+            if res is None:
+                consecutive_fails += 1; stats["failed"] += 1
+                print(f"  FAILED after {attempts} attempts: {err}")
+                save_observation(con, post, None, run_id, attempts, False, err, vocab_ids)
+                if consecutive_fails >= MAX_CONSECUTIVE_FAILS:
+                    print(f"\nStopping: {MAX_CONSECUTIVE_FAILS} failures in a row. Fix the cause, then re-run (resume skips finished posts).")
+                    break
                 continue
+            consecutive_fails = 0
 
-            print(f"[{i}/{total}] {title_preview}")
-
+            # ---- validate (code owns grades, caps, spans)
             try:
-                analysis = call_model(client, row)
+                res = validate_post(res, post["title"] + "\n" + post["body"], vocab_ids,
+                                    set(CAPABILITY_CATALOG), CAPABILITY_CATALOG or None)
+            except Exception:
+                traceback.print_exc()
+                save_observation(con, post, res, run_id, attempts, first_ok, "validate_post crashed", vocab_ids)
+                stats["failed"] += 1; continue
 
-                # Relevance gate: this post might not be about automation at
-                # all (a design job, a photography job, etc). Only run the
-                # hard gate / provenance / occurrence tracking on posts that
-                # actually describe an automatable problem.
-                if not analysis.get("is_automation_relevant", True):
-                    reason = analysis.get("relevance_reason", "")
-                    print(f"  FILTERED OUT (not automation-relevant): {reason}")
-                    filtered_writer.writerow({
-                        "source_job_id": job_id_preview,
-                        "job_title": row.get("job_title", ""),
-                        "job_url": row.get("job_url", ""),
-                        "relevance_reason": reason,
-                    })
-                    filtered_file.flush()
-                    filtered_count += 1
-                    seen_jobs.add(job_id_preview)  # don't re-check it every run
-                    continue
+            review_all += save_observation(con, post, res, run_id, attempts, first_ok, None, vocab_ids)
+            jf.write(json.dumps({"post_id": post["post_id"], "result": res}, ensure_ascii=False) + "\n")
 
-                analysis = apply_hard_gate(analysis)
-                analysis = add_provenance_and_occurrence(analysis, row, occurrence_store, i)
-                analysis = normalize_for_csv(analysis)
-                seen_jobs.add(job_id_preview)
-            except Exception as e:
-                print(f"  FAILED to analyze row {i}: {e}")
-                analysis = {col: "ERROR" for col in ANALYSIS_COLUMNS}
-                # Do NOT mark as seen - a failed row should be retried on the
-                # next run, not silently skipped forever.
+            stats[f"type:{res.get('post_type')}"] += 1
+            probs = res.get("problems") or []
+            if res.get("is_relevant"): stats["relevant"] += 1
+            print(f"  {res.get('post_type')} | relevant={res.get('is_relevant')} | problems={len(probs)}"
+                  + (f" | {probs[0].get('pattern',{}).get('existing_id') or probs[0].get('pattern',{}).get('proposed_name')}" if probs else ""))
 
-            merged = dict(row)
-            for col in ANALYSIS_COLUMNS:
-                merged[col] = analysis.get(col, "")
-            enriched_rows.append(merged)
+            base = {"post_id": post["post_id"], "client_key": post["client_key"], "title": post["title"],
+                    "date_posted": post["date_posted"], "post_type": res.get("post_type"),
+                    "is_relevant": res.get("is_relevant"), "copied_template": int(copied),
+                    "relevance_reason": res.get("relevance_reason"), "client_ask": res.get("client_ask")}
+            if not probs:
+                csv_rows.append(base)
+            for idx, p in enumerate(probs):
+                sc = p.get("scores", {}); pt = p.get("pattern") or {}
+                def val(k): return (p.get(k) or {}).get("value") if isinstance(p.get(k), dict) else None
+                csv_rows.append({**base, "problem_idx": idx, "role": p.get("role"),
+                    "problem_statement": p.get("problem_statement"), "workflow_object": p.get("workflow_object"),
+                    "pain_type": p.get("pain_type"), "pattern_id": pt.get("existing_id"),
+                    "proposed_pattern": pt.get("proposed_name"), "evidence_grade": p.get("evidence_grade"),
+                    "freq": val("freq"), "time": val("time"), "impact": val("impact"),
+                    "hiring_type": p.get("hiring_type"), "spending_observed": p.get("spending_observed"),
+                    "automation_fit": p.get("automation_fit"), "automation_inappropriate": p.get("automation_inappropriate"),
+                    "recurrence_strength": sc.get("recurrence_strength"), "time_cost_signal": sc.get("time_cost_signal"),
+                    "business_impact_signal": sc.get("business_impact_signal"),
+                    "problem_confidence": sc.get("problem_confidence"), "needs_review": p.get("needs_review"),
+                    "validation_errors": "; ".join(p.get("validation_errors", []))})
 
-            writer.writerow({k: merged.get(k, "") for k in fieldnames})
-            out_file.flush()
+    # ---- write CSV outputs (timestamped: never overwrites earlier runs)
+    if csv_rows:
+        cols = list(dict.fromkeys(k for r in csv_rows for k in r))
+        out_csv = os.path.join(args.out_dir, f"problems_{run_id}.csv")
+        with open(out_csv, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.DictWriter(f, fieldnames=cols); w.writeheader(); w.writerows(csv_rows)
+        print(f"\nProblems CSV:     {out_csv}")
+    if review_all:
+        rv = os.path.join(args.out_dir, f"pattern_review_{run_id}.csv")
+        with open(rv, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.DictWriter(f, fieldnames=list(review_all[0].keys())); w.writeheader(); w.writerows(review_all)
+        print(f"Pattern review:   {rv}  (human decides merge / new)")
+    print(f"Raw JSONL:        {jsonl_path}\nDatabase:         {db_path}")
 
-            # Checkpoint the stores every 5 rows too, not just at the end.
-            if i % 5 == 0:
-                save_occurrence_store(occurrence_store)
-                save_seen_jobs(seen_jobs)
-
-            # Be polite to the API between calls
-            time.sleep(0.5)
-    finally:
-        out_file.close()
-        filtered_file.close()
-        save_occurrence_store(occurrence_store)
-        save_seen_jobs(seen_jobs)
-
-    print(f"\nDone. problem_library CSV written to: {output_path}")
-    print(f"Posts filtered out as not automation-relevant ({filtered_count}): {filtered_out_path}")
-    print(f"Running problem_occurrence counts saved to: {OCCURRENCE_STORE_PATH}")
-    print(f"Seen-job dedup list saved to: {SEEN_JOBS_STORE_PATH}")
-    print_summary(enriched_rows)
-
+    # ---- summary
+    print("\n" + "=" * 60 + "\nSUMMARY (v3)\n" + "=" * 60)
+    calls = stats["calls"]
+    print(f"Posts in file: {len(posts)} | model calls: {calls} | skipped: {stats['skipped']} | "
+          f"dup (same client): {stats['dup']} | failed: {stats['failed']}")
+    if calls:
+        print(f"JSON valid on first try: {stats['first_try_ok']}/{calls} ({100*stats['first_try_ok']//calls}%)")
+    print(f"Relevant posts: {stats['relevant']}")
+    print("Post types:", {k[5:]: v for k, v in stats.items() if k.startswith("type:")})
+    grades = Counter(r[0] for r in con.execute(
+        "SELECT pr.evidence_grade FROM problems pr JOIN observations o ON o.obs_id=pr.obs_id WHERE o.run_id=?", (run_id,)))
+    print("Evidence grades:", dict(grades))
+    print("\nPattern metrics (CLIENTS, not posts; unknown clients are not counted):")
+    for r in con.execute("SELECT pattern_id, posts, unique_clients, clients_with_spending, strong_obs "
+                         "FROM problem_metrics ORDER BY unique_clients DESC, posts DESC"):
+        flag = "" if r[2] >= 5 else "  <- insufficient_repetition"
+        print(f"  {r[0]:36s} posts={r[1]:<3d} clients={r[2]:<3d} spending={r[3]:<3d} strong={r[4]}{flag}")
+    con.close()
 
 if __name__ == "__main__":
     main()
